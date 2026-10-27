@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-cropmaster"
+version = "1.0.0"
+authors = [
+  { name = "PDF-CropMaster Contributors" },
+]
+description = "专治批量 PDF 留白与扫描件白边！每页独立自适应裁剪、纯矢量无损、多进程并行秒级处理（桌面 GUI / 网页 Web / 命令行 CLI）。"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "pymupdf>=1.24.0",
+    "tkinterdnd2>=0.3.2",
+    "pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=6.5.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/your-username/pdf-cropmaster"
+"Bug Tracker" = "https://github.com/your-username/pdf-cropmaster/issues"
+
+[project.scripts]
+pdf-cropmaster = "auto_crop_pdf:main"

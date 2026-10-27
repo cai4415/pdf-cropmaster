@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# 打包构建依赖
+pyinstaller>=6.5.0

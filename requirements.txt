@@ -1,0 +1,4 @@
+# 核心运行依赖
+pymupdf>=1.24.0
+tkinterdnd2>=0.3.2; sys_platform == 'win32' or sys_platform == 'darwin' or sys_platform == 'linux'
+pillow>=10.0.0
