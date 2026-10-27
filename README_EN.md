@@ -65,7 +65,7 @@ When cropping PDF margins using standard office software (like WPS Office or Ado
 
 ### Option 1: Standalone Windows Executable
 
-Download the latest `PDF-CropMaster.exe` from [GitHub Releases](https://github.com/your-username/pdf-cropmaster/releases).
+Download the latest `PDF-CropMaster.exe` from [GitHub Releases](https://github.com/cai4415/pdf-cropmaster/releases).
 - No Python installation required.
 - Double-click to launch the GUI and drag in your files!
 
@@ -73,7 +73,7 @@ Download the latest `PDF-CropMaster.exe` from [GitHub Releases](https://github.c
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/your-username/pdf-cropmaster.git
+git clone https://github.com/cai4415/pdf-cropmaster.git
 cd pdf-cropmaster
 
 # 2. Install dependencies

@@ -10,7 +10,7 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-brightgreen.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)]()
 [![Powered by PyMuPDF](https://img.shields.io/badge/engine-PyMuPDF-ff69b4.svg)](https://pymupdf.readthedocs.io/)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/your-username/pdf-cropmaster/pulls)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/cai4415/pdf-cropmaster/pulls)
 
 [English Documentation](README_EN.md) · [功能特性](#-核心特性) · [界面预览](#-界面预览) · [快速上手](#-快速上手) · [命令行使用](#-cli-命令行完整指南) · [核心原理解析](#-硬核原理解析)
 
@@ -66,7 +66,7 @@
 
 ### 方式一：下载绿色免安装版 (Windows)
 
-前往 [GitHub Releases](https://github.com/your-username/pdf-cropmaster/releases) 下载最新版的 `PDF-CropMaster.exe`：
+前往 [GitHub Releases](https://github.com/cai4415/pdf-cropmaster/releases) 下载最新版的 `PDF-CropMaster.exe`：
 - **开箱即用**：无需配置 Python 环境，下载即可双击运行。
 - **拖拽即裁**：直接将一个或多个 PDF 文件拖进窗口，点击「开始裁剪」即可。
 
@@ -74,7 +74,7 @@
 
 #### 1. 克隆代码仓库
 ```bash
-git clone https://github.com/your-username/pdf-cropmaster.git
+git clone https://github.com/cai4415/pdf-cropmaster.git
 cd pdf-cropmaster
 ```
 

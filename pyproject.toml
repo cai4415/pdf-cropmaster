@@ -30,8 +30,8 @@ dev = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/your-username/pdf-cropmaster"
-"Bug Tracker" = "https://github.com/your-username/pdf-cropmaster/issues"
+"Homepage" = "https://github.com/cai4415/pdf-cropmaster"
+"Bug Tracker" = "https://github.com/cai4415/pdf-cropmaster/issues"
 
 [project.scripts]
 pdf-cropmaster = "auto_crop_pdf:main"
