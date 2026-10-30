@@ -29,7 +29,8 @@ MANIFEST
 # PyInstaller
 *.manifest
 # We maintain packaging/pdf_cropmaster.spec, ignore root level temp specs
-PDF*.spec
+/PDF*.spec
+!packaging/*.spec
 
 # PyExecutables
 *.exe

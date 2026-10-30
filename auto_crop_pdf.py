@@ -19,6 +19,7 @@ PDF 每页独立智能裁剪（去白边）—— 替代 WPS "智能选区" 只�
 """
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -31,311 +32,164 @@ except ImportError:
     except ImportError:
         sys.exit("缺少 PyMuPDF。安装：pip install pymupdf")
 
+from _pdfcrop_worker import (
+    DARK_THRESHOLD,
+    PAGE_COVER_RATIO,
+    apply_cropbox_safe,
+    init_worker,
+    page_content_rect,
+    page_content_rect_auto,
+    pixel_content_rect,
+    scan_single_page,
+)
 
 MM_TO_PT = 72.0 / 25.4
-DARK_THRESHOLD = 245   # 灰度低于此值算“有内容”，用于识别扫描件白边
-PAGE_COVER_RATIO = 0.92  # 图元覆盖超过此比例 → 判定为扫描件，改用像素法
 
 
-# ---------------------------------------------------------------- 边界计算
+class UserInputError(ValueError):
+    """用户输入或文档状态类可预期错误（直接展示友好中文，不附带堆栈）。"""
 
-def pixel_content_rect(page, dpi=72, threshold=DARK_THRESHOLD):
-    """按像素内容判断真实边界（等同WPS「智能选区」的思路）。
 
-    为什么需要这条路径：
-    CAD 导出的扫描图纸，页面常被切成大量横贯整页的图片条
-    （实测「1#楼.pdf」每页 65 个 9918x272 的图片条首尾相接铺满全页）。
-    按图元位置算并集结果 = 整个页面 → 裁不掉任何东西。
-    只有看像素，才能识别真正的白边。
-
-    性能：灰度 pixmap + 逐行 min()，实测 1191x2105 页仅 0.016 秒。
-    （逐像素三层通道比较是它的 75 倍慢，不要用那种写法）
-    """
+def _safe_print(*args, **kwargs):
+    """在 --windowed 打包无控制台（stdout=None）环境下安全打印，绝不抛异常。"""
+    if getattr(sys, "stdout", None) is None:
+        return
     try:
-        pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
-    except Exception:
-        return None
-    if pix.width < 2 or pix.height < 2:
-        return None
-
-    sm, st, w, h = pix.samples, pix.stride, pix.width, pix.height
-
-    # 第一次扫：找出有内容的行（上下边界）
-    top, bot = -1, -1
-    for y in range(h):
-        if min(sm[y * st:y * st + st]) < threshold:
-            if top < 0:
-                top = y
-            bot = y
-    if top < 0:
-        return None  # 全白页
-
-    # 第二次扫：只在有内容的行里找左右边界
-    left, right = w, -1
-    for y in range(top, bot + 1):
-        row = sm[y * st:y * st + st]
-        for x in range(w):
-            if row[x] < threshold:
-                if x < left:
-                    left = x
-                break
-        for x in range(w - 1, -1, -1):
-            if row[x] < threshold:
-                if x > right:
-                    right = x
-                break
-
-    if right < 0 or right <= left:
-        return None
-
-    pr = page.rect
-    sx = pr.width / w
-    sy = pr.height / h
-    return fitz.Rect(left * sx, top * sy, (right + 1) * sx, (bot + 1) * sy)
-
-
-def _covers_whole_page(page, min_pt=1.0):
-    """判断页面的图元/文字是否几乎铺满整页（扫描件特征）。"""
-    pr = page.rect
-    page_area = pr.width * pr.height
-    if page_area <= 0:
-        return False
-
-    x0 = y0 = 1e30
-    x1 = y1 = -1e30
-    hit = False
-
-    try:
-        for info in page.get_images(full=True):
-            for r in page.get_image_rects(info[0]):
-                if not (r.is_valid and r.width > 0 and r.height > 0):
-                    continue
-                if r.x0 < x0:
-                    x0 = r.x0
-                if r.y0 < y0:
-                    y0 = r.y0
-                if r.x1 > x1:
-                    x1 = r.x1
-                if r.y1 > y1:
-                    y1 = r.y1
-                hit = True
-    except Exception:
-        pass
-    try:
-        for d in page.get_drawings():
-            r = d.get("rect")
-            if r is None or not r.is_valid or r.width < min_pt or r.height < min_pt:
-                continue
-            if r.x0 < x0:
-                x0 = r.x0
-            if r.y0 < y0:
-                y0 = r.y0
-            if r.x1 > x1:
-                x1 = r.x1
-            if r.y1 > y1:
-                y1 = r.y1
-            hit = True
+        print(*args, **kwargs)
     except Exception:
         pass
 
-    if not hit:
-        return False
-    cover = (x1 - x0) * (y1 - y0) / page_area
-    return cover >= PAGE_COVER_RATIO
 
-
-def page_content_rect_auto(page, min_pt=1.0, dpi=72):
-    """自动选择边界识别策略。
-
-    先按图元位置算；如果发现图元几乎铺满整页（扫描件特征），
-    改用像素法重算，否则会把整页当成内容导致裁不掉。
-    """
-    rect = page_content_rect(page, min_pt)
-    pr = page.rect
-    if rect is None:
-        # 图元层没检出，但可能有扫描图 → 交给像素法判断
-        return pixel_content_rect(page, dpi)
-
-    # 图元包围盒接近整页 → 多半是扫描件，切片图铺满，需像素法
-    cover = (rect.width * rect.height) / (pr.width * pr.height) \
-        if pr.width and pr.height else 0
-    if cover >= PAGE_COVER_RATIO:
-        pix = pixel_content_rect(page, dpi)
-        if pix is not None:
-            return pix
-    return rect
-
-
-# ---------------------------------------------------------------- 边界计算
-
-def page_content_rect(page, min_pt=1.0):
-    """算出这一页真实内容的最小外接矩形。返回 None 表示整页空白。
-
-    性能要点：全程用纯数值(float)累积包围盒，不用 Rect 对象做逐个合并运算。
-    复杂图纸单页可达数千个图元，用 `out |= r` 逐个合并是主要瓶颈，
-    改成比较四个标量后快一个数量级。
-    """
-    x0 = y0 = 1e30
-    x1 = y1 = -1e30
-    hit = False
-
-    # 1) 文字（blocks 已含多行合并，比 words 稳）
+def open_path_cross_platform(path, select=False):
+    """跨平台用系统默认程序打开文件/目录，或在资源管理器中选中文件。"""
+    if not path:
+        return
     try:
-        for b in page.get_text("blocks"):
-            bx0, by0, bx1, by1 = b[0], b[1], b[2], b[3]
-            if bx1 > bx0 and by1 > by0:
-                if bx0 < x0:
-                    x0 = bx0
-                if by0 < y0:
-                    y0 = by0
-                if bx1 > x1:
-                    x1 = bx1
-                if by1 > y1:
-                    y1 = by1
-                hit = True
+        path = os.path.abspath(path)
+        if sys.platform == "win32":
+            if select and os.path.isfile(path):
+                import subprocess
+                subprocess.Popen(["explorer", f"/select,{path}"])
+            else:
+                os.startfile(path)  # noqa: S606
+        elif sys.platform == "darwin":
+            import subprocess
+            cmd = ["open", "-R", path] if (select and os.path.isfile(path)) else ["open", path]
+            subprocess.Popen(cmd)
+        else:
+            import subprocess
+            target = os.path.dirname(path) if (select and os.path.isfile(path)) else path
+            subprocess.Popen(["xdg-open", target])
     except Exception:
         pass
-
-    # 2) 图片
-    try:
-        for info in page.get_images(full=True):
-            for r in page.get_image_rects(info[0]):
-                if r.is_valid and r.width > 0 and r.height > 0:
-                    if r.x0 < x0:
-                        x0 = r.x0
-                    if r.y0 < y0:
-                        y0 = r.y0
-                    if r.x1 > x1:
-                        x1 = r.x1
-                    if r.y1 > y1:
-                        y1 = r.y1
-                    hit = True
-    except Exception:
-        pass
-
-    # 3) 矢量图元（表格线、线条、填充块）——CAD/规范文件里表格线是主要边界来源
-    try:
-        for d in page.get_drawings():
-            r = d.get("rect")
-            if r is None or not r.is_valid:
-                continue
-            if r.width < min_pt or r.height < min_pt:
-                continue
-            if r.x0 < x0:
-                x0 = r.x0
-            if r.y0 < y0:
-                y0 = r.y0
-            if r.x1 > x1:
-                x1 = r.x1
-            if r.y1 > y1:
-                y1 = r.y1
-            hit = True
-    except Exception:
-        pass
-
-    if not hit or x1 <= x0 or y1 <= y0:
-        return None
-    return fitz.Rect(x0, y0, x1, y1)
 
 
 # ---------------------------------------------------------------- 并行扫描
 
-def _scan_chunk(args):
-    """转发到独立 worker 模块。真正的实现在 _pdfcrop_worker.py。
-
-    必须转发而不是直接实现：Windows spawn 子进程会重新导入主模块，
-    worker 放主文件里会重复执行界面逻辑。
-    """
-    from _pdfcrop_worker import scan_chunk
-    return scan_chunk(args)
-
-
-def scan_pages_parallel(src, n, workers=0, min_pt=1.0, progress=None):
-    """并行扫描全部页面内容框。返回 {页码: Rect}。"""
+def scan_pages_parallel(src, n, workers=0, min_pt=1.0, progress=None, indices=None):
+    """并行扫描指定（或全部）页面内容框。返回 ({页索引: Rect}, [空白页1基页码...])。"""
     import multiprocessing as mp
 
-    # 用满所有物理核心。之前硬编码上限 8，在16 核机上等于白扔一半算力。
+    target_list = sorted(indices) if indices is not None else list(range(n))
+    total = len(target_list)
+    if total == 0:
+        return {}, []
+
     if workers <= 0:
         workers = os.cpu_count() or 4
-    workers = max(1, min(workers, n))
+    workers = max(1, min(workers, total))
 
-    # 单页或页数很少时，进程开销大于收益，直接串行
-    if workers == 1 or n <= 2:
+    # 单核或任务页数很少时直接串行，省去子进程启动开销
+    if workers == 1 or total <= 2:
         doc = fitz.open(src)
+        if doc.needs_pass:
+            doc.authenticate("")
         try:
             content, blanks = {}, []
-            for i in range(n):
+            for done_idx, i in enumerate(target_list, 1):
                 r = page_content_rect_auto(doc[i], min_pt)
-                (content.setdefault(i, r) if r is not None else None)
-                if r is None:
+                if r is not None:
+                    content[i] = r
+                else:
                     blanks.append(i + 1)
                 if progress:
-                    progress(i + 1, n)
+                    progress(done_idx, total)
             return content, blanks
         finally:
             doc.close()
 
-    # 每页一个任务，imaps 让空闲进程自动抢下一页。
-    # 实测 fitz.open 仅 1.2ms，拆到单页几乎无成本，却能彻底消除拖尾
-    # （原先均分 8 段，最后一段只有 1 页，其余进程干等）。
-    tasks = [(src, s, s + 1, min_pt) for s in range(n)]
-    pool_size = min(workers, n)
-
+    pool_size = min(workers, total)
     content, blanks = {}, []
     done = 0
-
-    # Windows 没有 fork，spawn 子进程需要能重新导入主模块。
-    # 在 stdin / 冻结(exe) 等环境下会反复报
-    # OSError: Invalid argument '<stdin>' 导致子进程连环崩溃，
-    # 因此这里必须 try/except 兜底，失败就退回串行，宁可慢也不能崩。
     ctx = mp.get_context("spawn")
 
     try:
-        with ctx.Pool(processes=pool_size) as pool:
-            for part in pool.imap_unordered(_scan_chunk, tasks):
-                for idx, box in part:
-                    done += 1
-                    if box is None:
-                        blanks.append(idx + 1)
-                    else:
-                        content[idx] = fitz.Rect(*box)
-                    if progress:
-                        progress(done, n)
-    except Exception as e:
-        import traceback
-        print(f"[提示] 并行不可用：{type(e).__name__}: {e}")
-        traceback.print_exc()
-        return scan_pages_parallel(src, n, workers=1, min_pt=min_pt,
-                                   progress=progress)
+        # initializer 让每个子进程仅 fitz.open() 一次，消除大文件重复打开 N 次的开销
+        with ctx.Pool(
+            processes=pool_size,
+            initializer=init_worker,
+            initargs=(src, min_pt),
+        ) as pool:
+            for idx, box in pool.imap_unordered(scan_single_page, target_list):
+                done += 1
+                if box is None:
+                    blanks.append(idx + 1)
+                else:
+                    content[idx] = fitz.Rect(*box)
+                if progress:
+                    progress(done, total)
+    except Exception:
+        # 子进程异常（如特殊沙箱/冻结环境限制）静默回退串行，绝不能调用裸 print 导致无控制台崩溃
+        return scan_pages_parallel(
+            src, n, workers=1, min_pt=min_pt, progress=progress, indices=target_list
+        )
 
     blanks.sort()
     return content, blanks
 
 
 def parse_page_spec(spec, n):
-    """把 '1-20,35,40-50' 解析成 0 基页码集合。"""
+    """把 '1-20,35,40-50' 解析成 0 基页码集合（兼容中文标点与波浪号/破折号）。"""
     out = set()
-    for part in spec.split(","):
-        part = part.strip()
+    if not spec or not str(spec).strip():
+        return set(range(n))
+
+    norm = str(spec)
+    for sep in ("，", "、", "；", ";"):
+        norm = norm.replace(sep, ",")
+    for dash in ("~", "～", "—", "–", "－"):
+        norm = norm.replace(dash, "-")
+
+    for raw_part in norm.split(","):
+        part = raw_part.strip()
         if not part:
             continue
         if "-" in part:
-            a, b = part.split("-", 1)
-            a, b = int(a), int(b)
-            a, b = int(a), int(b)
+            pieces = part.split("-", 1)
+            try:
+                a, b = int(pieces[0].strip()), int(pieces[1].strip())
+            except ValueError:
+                raise UserInputError(f"页码范围格式有误：「{raw_part.strip()}」（示例：1-20,35）") from None
+            if a <= 0 or b <= 0:
+                raise UserInputError(f"页码必须从 1 开始：「{raw_part.strip()}」")
             lo, hi = min(a, b), max(a, b)
             for p in range(lo, hi + 1):
                 if 1 <= p <= n:
                     out.add(p - 1)
         else:
-            p = int(part)
+            try:
+                p = int(part)
+            except ValueError:
+                raise UserInputError(f"页码格式有误：「{part}」（示例：1-20,35）") from None
+            if p <= 0:
+                raise UserInputError(f"页码必须从 1 开始：「{part}」")
             if 1 <= p <= n:
                 out.add(p - 1)
     return out
 
 
 def median_rect(rects):
-    """取各页内容框四条边的中位数，得到一个"大家都适用"的统一框。"""
+    """取各页内容框四条边的中位数，得到统一版心框。"""
     xs0 = sorted(r.x0 for r in rects)
     ys0 = sorted(r.y0 for r in rects)
     xs1 = sorted(r.x1 for r in rects)
@@ -349,33 +203,34 @@ def median_rect(rects):
         y0 = (ys0[mid - 1] + ys0[mid]) / 2
         x1 = (xs1[mid - 1] + xs1[mid]) / 2
         y1 = (ys1[mid - 1] + ys1[mid]) / 2
+    if x1 <= x0 or y1 <= y0:
+        return union_rect(rects)
     return fitz.Rect(x0, y0, x1, y1)
 
 
 def union_rect(rects):
-    out = rects[0]
+    out = fitz.Rect(rects[0])
     for r in rects[1:]:
         out |= r
     return out
 
 
 # ---------------------------------------------------------------- 公共处理流程
-# 下面三个函数是 tkinter 窗口与网页面板**共用**的唯一实现。
-# 上一轮的教训：两条入口各自复制一份扫描逻辑，结果只给其中一条加了多进程，
-# 另一条一直是串行。任何优化都必须加在这里，不要在入口里另写一份。
+# CLI 命令行、tkinter 桌面窗口、Web 浏览器面板 三端 100% 共用此唯一处理内核！
+
+def _is_already_cropped_name(filename):
+    stem = os.path.splitext(filename)[0]
+    if stem.endswith("_已裁剪"):
+        return True
+    if "_已裁剪_" in stem:
+        tail = stem.rsplit("_已裁剪_", 1)[1]
+        if tail.isdigit():
+            return True
+    return False
+
 
 def parse_drop_paths(tkroot, data):
-    """把 <<Drop>> 事件里的 event.data 解析成绝对路径列表。
-
-    为什么必须用 tkroot.tk.splitlist()：
-      Windows 下带空格的路径会被 Tcl 用花括号包裹，形如
-        {C:/Users/a b/1#楼 图纸.pdf} C:/tmp/x.pdf
-      用 str.split() 会把路径从空格处撕开（'.../1#楼' + '图纸.pdf}'），
-      之后 os.path.isfile 全部为 False，表现出来就是"拖进去没反应"。
-      splitlist 是 Tcl 自己的列表解析器，天生懂 {} 和 \" 转义。
-
-    返回 (pdf路径列表, 被忽略的条目数)。
-    """
+    """把 <<Drop>> 事件里的 event.data 解析成绝对路径列表（支持直接拖入 PDF 文件或整个文件夹）。"""
     try:
         raw = tkroot.tk.splitlist(data)
     except Exception:
@@ -386,45 +241,99 @@ def parse_drop_paths(tkroot, data):
         p = str(item).strip().strip('"').strip("'")
         if not p:
             continue
+        if os.path.isdir(p):
+            dir_pdfs = []
+            try:
+                for entry in sorted(os.listdir(p)):
+                    full = os.path.join(p, entry)
+                    if os.path.isfile(full) and entry.lower().endswith(".pdf"):
+                        if not _is_already_cropped_name(entry):
+                            dir_pdfs.append(os.path.abspath(full))
+            except OSError:
+                pass
+            if not dir_pdfs:
+                ignored += 1
+            else:
+                for ap in dir_pdfs:
+                    key = os.path.normcase(ap)
+                    if key not in seen:
+                        seen.add(key)
+                        paths.append(ap)
+            continue
+
         if not p.lower().endswith(".pdf") or not os.path.isfile(p):
             ignored += 1
             continue
         ap = os.path.abspath(p)
-        if ap not in seen:
-            seen.add(ap)
+        key = os.path.normcase(ap)
+        if key not in seen:
+            seen.add(key)
             paths.append(ap)
     return paths, ignored
 
 
 def unique_out(src, out_dir=None):
-    """生成不与已有文件冲突的输出路径：xxx_已裁剪.pdf、xxx_已裁剪_2.pdf …
-
-    为什么要这个：输出文件常常还开在 PDF 阅读器里，直接写会 PermissionError。
-    """
+    """生成不与已有文件冲突的输出路径：xxx_已裁剪.pdf、xxx_已裁剪_2.pdf …"""
     d = out_dir or os.path.dirname(os.path.abspath(src))
-    stem = os.path.splitext(os.path.basename(src))[0] + "_已裁剪"
+    base_stem = os.path.splitext(os.path.basename(src))[0]
+    stem = base_stem if base_stem.endswith("_已裁剪") else (base_stem + "_已裁剪")
     p = os.path.join(d, stem + ".pdf")
+    src_norm = os.path.normcase(os.path.abspath(src))
     k = 2
-    while os.path.exists(p):
+    while os.path.exists(p) or os.path.normcase(os.path.abspath(p)) == src_norm:
         p = os.path.join(d, f"{stem}_{k}.pdf")
         k += 1
     return p
 
 
+def _save_doc_resilient(doc, src, target_out, fallback_to_src_dir=False, log_fn=None):
+    """安全保存修改后的 PDF，处理父目录创建、阅读器文件锁占用（含 FzErrorSystem）及目录回退。"""
+    def _try_save(dest):
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        doc.save(dest, deflate=True, garbage=0)
+        return dest
+
+    try:
+        return _try_save(target_out)
+    except Exception as first_err:
+        err_msg = str(first_err).lower()
+        is_io_or_lock = isinstance(first_err, OSError) or any(
+            k in err_msg for k in ("permission", "cannot remove", "cannot open", "unable to open", "access is denied")
+        )
+        if not is_io_or_lock:
+            raise
+
+        # 1) 同目录换一个不冲突的新名字重试（解决目标文件正开在 WPS/Acrobat 中被锁死的问题）
+        try:
+            alt = unique_out(src, os.path.dirname(target_out))
+            if os.path.normcase(alt) == os.path.normcase(target_out):
+                base, ext = os.path.splitext(alt)
+                alt = f"{base}_{int(time.time()) % 10000}{ext}"
+            saved = _try_save(alt)
+            if log_fn:
+                log_fn(f"目标文件被占用，已自动改存为：{os.path.basename(saved)}")
+            return saved
+        except Exception:
+            if not fallback_to_src_dir:
+                raise
+
+        # 2) 自定义输出目录本身只读/无权限 → 直接零重扫回退到源文件所在目录
+        fallback_alt = unique_out(src, None)
+        saved = _try_save(fallback_alt)
+        if log_fn:
+            log_fn(f"自定义输出目录不可写，已回退存至源目录：{os.path.basename(saved)}")
+        return saved
+
+
 def process_one(src, out=None, margin=6.0, mode="each", only="", workers=0,
-                progress=None, log=None):
-    """处理一份 PDF：扫描每页内容框 → 写回 CropBox → 保存。**同步阻塞**。
-
-    progress(frac, text)  frac 0~0.5 是扫描阶段，0.5~1.0 是写回阶段
-    log(text)             人类可读的进度描述
-
-    返回 dict：
-      ok, skipped, src, out, pages, cropped, blanks, elapsed, error, rows
-      rows = [(页码, "原W×H", "新W×H", 保留百分比), ...]
-    """
+                progress=None, log=None, unit="mm", dry_run=False,
+                fallback_to_src_dir=False):
+    """处理单份 PDF：扫描每页内容框 → 安全转换并写回 CropBox → 保存。"""
     res = {"ok": False, "skipped": False, "src": src, "out": None,
            "pages": 0, "cropped": 0, "blanks": [], "elapsed": 0.0,
-           "error": None, "rows": []}
+           "error": None, "rows": [], "eff_workers": 1}
 
     def _p(frac, text=""):
         if progress:
@@ -441,120 +350,173 @@ def process_one(src, out=None, margin=6.0, mode="each", only="", workers=0,
                 pass
 
     t0 = time.time()
+    doc = None
     try:
-        src = os.path.abspath(str(src).strip().strip('"'))
+        src = os.path.abspath(str(src).strip().strip('"').strip("'"))
+        res["src"] = src
         if not os.path.isfile(src):
-            res["error"] = f"找不到文件：{src}"
-            return res
+            raise UserInputError(f"找不到文件：{src}")
 
         try:
             margin = float(margin)
         except (TypeError, ValueError):
-            res["error"] = "边距必须是数字"
-            return res
+            raise UserInputError("保留边距必须是数字") from None
+        if math.isnan(margin) or math.isinf(margin) or margin < 0:
+            raise UserInputError("保留边距不能为负数")
 
-        pad = margin * MM_TO_PT
-        doc = fitz.open(src)
+        pad = margin if unit == "pt" else margin * MM_TO_PT
+
+        if out and not dry_run:
+            out_clean = os.path.abspath(str(out).strip().strip('"').strip("'"))
+            if os.path.normcase(out_clean) == os.path.normcase(src):
+                raise UserInputError("输出文件不能与源文件相同，请指定其他文件名")
+        else:
+            out_clean = None
+
+        try:
+            doc = fitz.open(src)
+        except Exception as e:
+            raise UserInputError(f"无法打开 PDF（文件可能已损坏或非标准 PDF）：{e}") from None
+
+        if doc.needs_pass:
+            if not doc.authenticate(""):
+                doc.close()
+                doc = None
+                raise UserInputError("文件受密码保护，请先解除阅读密码后再裁剪")
+
         n = doc.page_count
-        doc.close()
         res["pages"] = n
+        if n <= 0:
+            doc.close()
+            doc = None
+            raise UserInputError("PDF 文档没有任何页面（0 页）")
 
         targets = parse_page_spec(only, n) if only else set(range(n))
         if only and not targets:
-            res["error"] = f"「{only}」没匹配到任何页（有效范围 1-{n}）"
-            return res
+            doc.close()
+            doc = None
+            raise UserInputError(f"页码范围「{only}」未匹配到任何有效页（文档共 1-{n} 页）")
+
+        page_sizes = {}
+        for i in range(n):
+            pr = doc[i].rect
+            page_sizes[i] = (round(pr.width), round(pr.height))
+        doc.close()
+        doc = None
+
+        scan_indices = sorted(targets) if (only and mode == "each") else list(range(n))
 
         ncpu = os.cpu_count() or 4
-        eff = workers if workers and workers > 0 else min(ncpu, max(1, n))
-        _l(f"共 {n} 页，{eff} 进程并行扫描中…（CPU {ncpu} 核）")
+        try:
+            req_w = int(workers or 0)
+        except (TypeError, ValueError):
+            req_w = 0
+        eff = min(req_w, len(scan_indices)) if req_w > 0 else min(ncpu, max(1, len(scan_indices)))
+        if len(scan_indices) <= 2:
+            eff = 1
+        res["eff_workers"] = eff
+        _l(f"共 {n} 页（待扫 {len(scan_indices)} 页），{eff} 进程并行扫描中…（CPU {ncpu} 核）")
 
         content, blanks = scan_pages_parallel(
-            src, n, workers,
-            progress=lambda d, t: _p(0.5 * d / max(t, 1), f"扫描中 {d}/{t}"))
+            src, n, workers=req_w,
+            progress=lambda d, t: _p(0.5 * d / max(t, 1), f"扫描中 {d}/{t}"),
+            indices=scan_indices,
+        )
         res["blanks"] = blanks
         _l(f"扫描完成：检出内容 {len(content)} 页"
            + (f"，空白页 {len(blanks)} 页" if blanks else ""))
 
         if not content:
             res["skipped"] = True
-            res["error"] = "没有任何页面检出内容（可能是全白页）"
+            res["error"] = "没有任何页面检出可见内容（可能是全白页）"
             return res
 
-        fixed = None
+        fixed_by_size = {}
         if mode in ("uniform", "union"):
-            rects = list(content.values())
-            fixed = median_rect(rects) if mode == "uniform" else union_rect(rects)
-            _l(f"统一裁剪框：{fixed.x0:.1f},{fixed.y0:.1f} → "
-               f"{fixed.x1:.1f},{fixed.y1:.1f} pt")
+            grouped = {}
+            for idx, rect in content.items():
+                grouped.setdefault(page_sizes[idx], []).append(rect)
+            for sz_key, rects in grouped.items():
+                fixed = median_rect(rects) if mode == "uniform" else union_rect(rects)
+                fixed_by_size[sz_key] = fixed
+                _l(f"统一裁剪框 [{sz_key[0]}×{sz_key[1]} pt]："
+                   f"{fixed.x0:.1f},{fixed.y0:.1f} → {fixed.x1:.1f},{fixed.y1:.1f} pt")
 
         doc = fitz.open(src)
+        if doc.needs_pass:
+            doc.authenticate("")
+
         cnt = 0
         for i in range(n):
+            if i not in targets:
+                continue
             page = doc[i]
             pr = page.rect
-            base = fixed if (fixed and i in content) else content.get(i)
-            if base is None or i not in targets:
+            base = fixed_by_size.get(page_sizes[i]) if (fixed_by_size and i in content) else content.get(i)
+            if base is None:
                 continue
-            cr = fitz.Rect(base.x0 - pad, base.y0 - pad,
-                           base.x1 + pad, base.y1 + pad) & pr
-            if cr.width < 1 or cr.height < 1:
+
+            target_vr = fitz.Rect(base.x0 - pad, base.y0 - pad, base.x1 + pad, base.y1 + pad) & pr
+            if target_vr.is_empty or target_vr.width < 1.0 or target_vr.height < 1.0:
                 continue
-            page.set_cropbox(cr)
+
+            old_w, old_h = pr.width, pr.height
+            if dry_run:
+                applied_vr = target_vr
+            else:
+                applied_vr = apply_cropbox_safe(page, target_vr)
+                if applied_vr is None:
+                    continue
+
             cnt += 1
-            ratio = (cr.width * cr.height / (pr.width * pr.height) * 100) \
-                if pr.width and pr.height else 0
-            res["rows"].append((i + 1, f"{pr.width:.0f}×{pr.height:.0f}",
-                                f"{cr.width:.0f}×{cr.height:.0f}", int(ratio)))
+            ratio = (applied_vr.width * applied_vr.height / (old_w * old_h) * 100.0) if (old_w and old_h) else 0.0
+            res["rows"].append((
+                i + 1,
+                f"{old_w:.0f}×{old_h:.0f}",
+                f"{applied_vr.width:.0f}×{applied_vr.height:.0f}",
+                int(round(ratio)),
+            ))
             _p(0.5 + 0.5 * (i + 1) / n, f"写回裁剪框 {i + 1}/{n}")
 
         res["cropped"] = cnt
         if cnt == 0:
             doc.close()
+            doc = None
             res["skipped"] = True
-            res["error"] = "没有页面被裁剪（选中的页可能都是空白）"
+            res["error"] = "没有页面需要裁剪（选中的页可能都是空白）"
             return res
 
-        if not out:
-            out = unique_out(src)
-        out = os.path.abspath(str(out).strip().strip('"'))
-        if out == src:
+        if dry_run:
             doc.close()
-            res["error"] = "输出文件不能与源文件相同"
+            doc = None
+            res["ok"] = True
             return res
 
-        # garbage=3 会做全对象清理，19MB 文件实测 >100 秒；
-        # 只改 CropBox 不删对象，garbage=0 即可，体积几乎不变。
-        try:
-            doc.save(out, deflate=True, garbage=0)
-        except PermissionError:
-            # 输出文件还开在阅读器里 → 换个名字重试
-            doc.close()
-            doc = fitz.open(src)
-            for i in range(n):
-                page = doc[i]
-                pr = page.rect
-                base = fixed if (fixed and i in content) else content.get(i)
-                if base is None or i not in targets:
-                    continue
-                cr = fitz.Rect(base.x0 - pad, base.y0 - pad,
-                               base.x1 + pad, base.y1 + pad) & pr
-                if cr.width >= 1 and cr.height >= 1:
-                    page.set_cropbox(cr)
-            alt = unique_out(src, os.path.dirname(out))
-            _l(f"目标文件被占用，改存：{os.path.basename(alt)}")
-            doc.save(alt, deflate=True, garbage=0)
-            out = alt
+        dest = out_clean or unique_out(src)
+        saved_out = _save_doc_resilient(
+            doc, src, dest, fallback_to_src_dir=fallback_to_src_dir, log_fn=_l
+        )
         doc.close()
+        doc = None
 
-        res["out"] = out
+        res["out"] = saved_out
         res["ok"] = True
-        _l(f"完成：{cnt} 页已裁剪 → {os.path.basename(out)}")
+        _p(1.0, "完成")
+        _l(f"完成：{cnt} 页已裁剪 → {os.path.basename(saved_out)}")
+        return res
+    except UserInputError as ue:
+        res["error"] = str(ue)
         return res
     except Exception as e:  # noqa: BLE001
         import traceback
         res["error"] = f"{e}\n{traceback.format_exc()[-600:]}"
         return res
     finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
         res["elapsed"] = time.time() - t0
 
 
@@ -571,86 +533,49 @@ def main():
     ap.add_argument("--unit", choices=["mm", "pt"], default="mm",
                     help="边距单位，默认 mm；pt = 1/72 英寸")
     ap.add_argument("--mode", choices=["each", "uniform", "union"], default="each",
-                    help="each=每页各自裁（默认）；uniform=按各页中位数统一；union=按并集统一")
+                    help="each=每页各自裁（默认）；uniform=按同规格中位数统一；union=按并集统一")
     ap.add_argument("--only", help="只裁这些页，如 1-20,35,40-50（页码 1 起）")
     ap.add_argument("--dry-run", action="store_true", help="只打印结果，不写文件")
     ap.add_argument("-j", "--workers", type=int, default=0,
-                    help="并行进程数，0=自动（按 CPU 核数）；1=单线程")
+                    help="并行进程数，0=自动（按 CPU 核数）；1=单进程")
     args = ap.parse_args()
 
-    pad = args.margin if args.unit == "pt" else args.margin * MM_TO_PT
+    def cli_prog(frac, text=""):
+        if frac <= 0.5 and text:
+            _safe_print(f"\r  {text:<26}", end="", flush=True)
 
-    doc = fitz.open(args.src)
-    n = doc.page_count
-    targets = parse_page_spec(args.only, n) if args.only else set(range(n))
+    def cli_log(msg):
+        _safe_print(f"\r{msg:<60}")
 
-    # --- 第一遍：算出每页内容框（多进程并行）---
-    t0 = time.time()
-    print(f"共 {n} 页，{args.workers or 'auto'} 进程并行扫描中…")
-    sys.stdout.flush()
+    res = process_one(
+        args.src,
+        out=args.out,
+        margin=args.margin,
+        mode=args.mode,
+        only=args.only or "",
+        workers=args.workers,
+        progress=cli_prog,
+        log=cli_log,
+        unit=args.unit,
+        dry_run=args.dry_run,
+    )
 
-    def cli_prog(done, total):
-        print(f"\r  扫描进度 {done}/{total}", end="", flush=True)
+    if res["blanks"]:
+        _safe_print(f"空白页（跳过，不裁）：{', '.join(map(str, res['blanks']))}")
 
-    content, blanks = scan_pages_parallel(args.src, n, args.workers,
-                                          progress=cli_prog)
-    print(f"\r  扫描完成，用时 {time.time() - t0:.1f}s{' ' * 20}")
+    if not res["ok"]:
+        _safe_print(f"\n[未完成] {res['error']}")
+        sys.exit(0 if res["skipped"] else 1)
 
-    print(f"检出内容 {len(content)} 页")
-    if blanks:
-        print(f"空白页（跳过，不裁）：{', '.join(map(str, blanks))}")
-
-    if not content:
-        print("没有任何页面检出内容，退出。")
-        return
-
-    # --- 决定用哪种统一框 ---
-    fixed_rect = None
-    if args.mode in ("uniform", "union"):
-        rects = list(content.values())
-        fixed_rect = median_rect(rects) if args.mode == "uniform" else union_rect(rects)
-        print(f"统一裁剪框（{args.mode}）："
-              f"L={fixed_rect.x0:.1f} T={fixed_rect.y0:.1f} "
-              f"R={fixed_rect.x1:.1f} B={fixed_rect.y1:.1f} pt")
-
-    # --- 第二遍：写回 CropBox ---
-    changed = 0
-    print("\n页码    原始框(W×H pt)          裁剪框(W×H pt)          尺寸变化")
-    print("-" * 74)
-    for i in range(n):
-        page = doc[i]
-        pr = page.rect  # 页面可见框（MediaBox）
-        base = fixed_rect if (fixed_rect and i in content) else content.get(i)
-
-        if base is None or i not in targets:
-            continue  # 空白页 / 未选中页：原样保留
-
-        cr = fitz.Rect(base.x0 - pad, base.y0 - pad, base.x1 + pad, base.y1 + pad)
-        # 夹到页面范围内，避免出现负坐标或超出页面
-        cr &= pr
-        # 防止被裁成 0 宽或高度为负
-        if cr.width < 1 or cr.height < 1:
-            continue
-
-        old_wh = f"{pr.width:.0f}×{pr.height:.0f}"
-        new_wh = f"{cr.width:.0f}×{cr.height:.0f}"
-        ratio = cr.width * cr.height / (pr.width * pr.height) * 100 if pr.width * pr.height else 0
-        print(f"{i+1:>4}    {old_wh:<22} {new_wh:<22} 保留 {ratio:.0f}%")
-
-        if not args.dry_run:
-            page.set_cropbox(cr)
-        changed += 1
+    _safe_print("\n页码    原始框(W×H pt)          裁剪框(W×H pt)          尺寸变化")
+    _safe_print("-" * 74)
+    for pno, old_wh, new_wh, ratio in res["rows"]:
+        _safe_print(f"{pno:>4}    {old_wh:<22} {new_wh:<22} 保留 {ratio}%")
 
     if args.dry_run:
-        print("\n[dry-run] 未写入文件。去掉 --dry-run 即可实际输出。")
-        return
-
-    out = args.out or (args.src.rsplit(".", 1)[0] + "_已裁剪.pdf")
-    # garbage=3 会做全对象清理，19MB 文件实测 >100 秒；
-    # 这里只改 CropBox 不删对象，用 garbage=0 即可，体积几乎不变。
-    doc.save(out, deflate=True, garbage=0)
-    doc.close()
-    print(f"\n完成：{changed} 页已裁剪 → {out}")
+        _safe_print(f"\n[dry-run] 模拟完成（共 {res['cropped']} 页可裁剪，用时 {res['elapsed']:.2f}s），未写入文件。")
+    else:
+        _safe_print(f"\n完成：{res['cropped']} 页已裁剪（用时 {res['elapsed']:.2f}s）→ {res['out']}")
 
 
 # ---------------------------------------------------------------- 图形界面
@@ -825,11 +750,21 @@ function run(){
     document.getElementById('pct').textContent='';
     log.textContent=d.log;
     var fin=document.getElementById('fin');
+    fin.textContent='';
     if(d.ok){
-      fin.innerHTML='<span class="ok">✔ 完成</span>　输出文件：<br><b>'+d.out+'</b>'
-        +'<br><div class="hint">已尝试用默认程序打开，若没弹出请手动到上述路径查看。</div>';
+      var s1=document.createElement('span');s1.className='ok';s1.textContent='✔ 完成';
+      var b1=document.createElement('b');b1.textContent=d.out||'';
+      var h1=document.createElement('div');h1.className='hint';
+      h1.textContent='已尝试用默认程序打开，若没弹出请手动到上述路径查看。';
+      fin.appendChild(s1);
+      fin.appendChild(document.createTextNode('　输出文件：'));
+      fin.appendChild(document.createElement('br'));
+      fin.appendChild(b1);
+      fin.appendChild(document.createElement('br'));
+      fin.appendChild(h1);
     }else{
-      fin.innerHTML='<span class="err">✘ 失败</span>';
+      var s2=document.createElement('span');s2.className='err';s2.textContent='✘ 失败';
+      fin.appendChild(s2);
     }
     btn.disabled=false;btn.textContent='开始裁剪';
   })
@@ -846,18 +781,7 @@ function run(){
              "progress": 0.0}  # progress 由裁剪线程写、进度接口读
 
     def _open_file(path):
-        """用系统默认程序打开文件（失败就忽略，不影响裁剪结果）。"""
-        try:
-            if sys.platform == "win32":
-                os.startfile(path)  # noqa
-            elif sys.platform == "darwin":
-                import subprocess
-                subprocess.Popen(["open", path])
-            else:
-                import subprocess
-                subprocess.Popen(["xdg-open", path])
-        except Exception:
-            pass
+        open_path_cross_platform(path)
 
     # ---------------------------------------------------------- 后端逻辑
 
@@ -913,10 +837,16 @@ function run(){
         src_path = (req.get("src") or "").strip().strip('"')
         if not src_path:
             return "请填写 PDF 路径。\n", "", False
+        raw_m = req.get("margin")
         try:
-            margin = float(req.get("margin") or 6)
-        except ValueError:
+            margin = float(6.0 if raw_m in (None, "") else raw_m)
+        except (TypeError, ValueError):
             return "边距请填数字。\n", "", False
+
+        try:
+            workers = int(req.get("workers") or 0)
+        except (TypeError, ValueError):
+            workers = 0
 
         state["progress"] = 0.0
 
@@ -928,12 +858,12 @@ function run(){
             src_path, out=out or None, margin=margin,
             mode=req.get("mode", "each"),
             only=(req.get("only") or "").strip(),
-            workers=int(req.get("workers") or 0),
+            workers=workers,
             progress=prog)
 
         lines = [f"文件：{res['src']}", f"总页数：{res['pages']}    边距：{margin} 毫米"]
         ncpu = os.cpu_count() or 4
-        lines.append(f"并行进程：{min(ncpu, max(1, res['pages']))}（CPU {ncpu} 核）")
+        lines.append(f"并行进程：{res.get('eff_workers', 1)}（CPU {ncpu} 核）")
         lines.append(f"扫描 + 写回用时 {res['elapsed']:.1f} 秒")
 
         if res["error"]:
@@ -1012,18 +942,20 @@ function run(){
     port = httpd.server_address[1]
     url = f"http://127.0.0.1:{port}/"
 
-    print("=" * 58)
-    print("  PDF 批量智能裁剪")
-    print("=" * 58)
-    print(f"操作面板已在浏览器打开：{url}")
-    print("关掉这个黑色命令行窗口即退出程序。")
-    print()
+    _safe_print("=" * 58)
+    _safe_print("  PDF 批量智能裁剪")
+    _safe_print("=" * 58)
+    _safe_print(f"操作面板已在浏览器打开：{url}")
+    _safe_print("关掉这个黑色命令行窗口即退出程序。")
+    _safe_print()
 
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    try:
-        webbrowser.open(url)
-    except Exception:
-        pass
+    def _launch_browser():
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    threading.Timer(0.15, _launch_browser).start()
 
     try:
         httpd.serve_forever()
@@ -1075,7 +1007,14 @@ def run_tk_gui(_selftest_dir=None):
              "results": [], "last_dir": None, "next_uid": 0,
              "quiet": False}   # quiet=True 时抑制弹窗（自检用）
 
-    # ---------------- 建窗口（拖拽扩展装不上就降级） ----------------
+    # ---------------- 建窗口（高分屏适配 + 拖拽扩展装不上就降级） ----------------
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
     has_dnd = False
     dnd_files = "DND_Files"
     copy_action = "copy"
@@ -1238,6 +1177,8 @@ def run_tk_gui(_selftest_dir=None):
             if not inside:
                 return None
             d = e.delta
+            if not d:
+                return None
             steps = -int(d / 120) or (-1 if d > 0 else 1)
             list_canvas.yview_scroll(steps * 3, "units")
             return "break"
@@ -1379,7 +1320,7 @@ def run_tk_gui(_selftest_dir=None):
     def open_last_dir():
         d = state["last_dir"]
         if d and os.path.isdir(d):
-            os.startfile(d)  # noqa: S606
+            open_path_cross_platform(d)
         else:
             messagebox.showinfo("提示", "还没有处理过文件。")
 
@@ -1689,15 +1630,12 @@ def run_tk_gui(_selftest_dir=None):
                 UIQ.put(("prog", _uid, frac, text))
 
             out = unique_out(src, opt["outdir"] or None)
-            res = process_one(src, out=out, margin=opt["margin"], mode=opt["mode"],
-                              only=opt["only"], workers=opt["workers"],
-                              progress=prog, log=lambda s: UIQ.put(("log", s)))
-            # 输出目录不可写时退回源目录
-            if not res.get("ok") and opt["outdir"] and not res.get("skipped"):
-                res = process_one(src, out=unique_out(src), margin=opt["margin"],
-                                  mode=opt["mode"], only=opt["only"],
-                                  workers=opt["workers"],
-                                  progress=prog, log=lambda s: UIQ.put(("log", s)))
+            res = process_one(
+                src, out=out, margin=opt["margin"], mode=opt["mode"],
+                only=opt["only"], workers=opt["workers"],
+                progress=prog, log=lambda s: UIQ.put(("log", s)),
+                fallback_to_src_dir=bool(opt["outdir"]),
+            )
             UIQ.put(("done", uid, res))
 
     threading.Thread(target=worker_loop, daemon=True).start()
@@ -1705,15 +1643,14 @@ def run_tk_gui(_selftest_dir=None):
     def open_results(ok):
         try:
             dirs = {os.path.dirname(r["out"]) for r in ok}
-            state["last_dir"] = ok[-1]["out"].rsplit(os.sep, 1)[0]
+            state["last_dir"] = os.path.dirname(ok[-1]["out"])
             if len(ok) == 1:
-                os.startfile(ok[0]["out"])  # noqa: S606
+                open_path_cross_platform(ok[0]["out"])
             elif len(dirs) == 1:
                 # 多文件同目录：开资源管理器，不要逐个开 PDF（会弹一堆阅读器）
-                os.startfile(dirs.pop())  # noqa: S606
+                open_path_cross_platform(dirs.pop())
             else:
-                import subprocess
-                subprocess.Popen(f'explorer /select,"{ok[-1]["out"]}"')
+                open_path_cross_platform(ok[-1]["out"], select=True)
         except Exception:
             pass
 
@@ -1725,7 +1662,7 @@ def run_tk_gui(_selftest_dir=None):
         # skipped 也带 error 文本，不能算失败（以前的判定会误报）
         bad = [r for r in results if not r.get("ok") and not r.get("skipped")]
         if ok:
-            state["last_dir"] = ok[-1]["out"].rsplit(os.sep, 1)[0]
+            state["last_dir"] = os.path.dirname(ok[-1]["out"])
         waiting = sum(1 for i in items.values() if i["status"] == "wait")
 
         parts = [f"本轮完成 {len(ok)}/{len(results)}"]

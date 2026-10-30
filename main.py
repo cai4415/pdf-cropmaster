@@ -2,20 +2,17 @@
 # -*- coding: utf-8 -*-
 """PDF-CropMaster (智能多核 PDF 批量裁剪工具) 快速启动入口。
 
-- 直接运行：启动桌面现代化 GUI 窗口（支持拖拽多个 PDF 批量排队处理）
+- 直接运行：启动桌面现代化 GUI 窗口（支持拖拽多个 PDF 或文件夹批量排队处理）
 - 命令行运行：传入参数（如 python main.py input.pdf）自动切换为 CLI 模式
 - 网页模式：传入 --web-gui 启动轻量级本地网页端界面
 """
 
-import sys
 import multiprocessing
-from auto_crop_pdf import main, run_gui, run_web_gui, run_tk_gui, gui_selftest
+import sys
 
-if __name__ == "__main__":
-    try:
-        multiprocessing.freeze_support()
-    except Exception:
-        pass
+
+def _entry():
+    from auto_crop_pdf import gui_selftest, main, run_gui, run_tk_gui, run_web_gui
 
     if any(a.startswith("--gui-selftest-list") for a in sys.argv[1:]):
         d = ""
@@ -36,3 +33,11 @@ if __name__ == "__main__":
         main()
     else:
         run_gui()
+
+
+if __name__ == "__main__":
+    try:
+        multiprocessing.freeze_support()
+    except Exception:
+        pass
+    _entry()
