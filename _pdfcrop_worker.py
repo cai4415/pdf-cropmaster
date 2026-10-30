@@ -17,6 +17,7 @@ try:
 except ImportError:
     import fitz
 
+__version__ = "1.1.0"
 
 DARK_THRESHOLD = 245          # 灰度 < 245 视为“有墨迹内容”（0=纯黑，255=纯白）
 WHITE_NORM = DARK_THRESHOLD / 255.0   # 约 0.9608，与像素阈值严格对齐

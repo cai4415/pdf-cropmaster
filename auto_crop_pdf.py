@@ -35,6 +35,7 @@ except ImportError:
 from _pdfcrop_worker import (
     DARK_THRESHOLD,
     PAGE_COVER_RATIO,
+    __version__,
     apply_cropbox_safe,
     init_worker,
     page_content_rect,
@@ -527,6 +528,7 @@ def main():
         description="PDF 每页独立智能裁剪（去白边）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    ap.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     ap.add_argument("src", help="输入 PDF")
     ap.add_argument("-o", "--out", help="输出 PDF（默认 <输入名>_已裁剪.pdf）")
     ap.add_argument("-m", "--margin", type=float, default=6.0, help="内容外扩边距，默认 6")
@@ -1038,7 +1040,7 @@ def run_tk_gui(_selftest_dir=None):
             pass
         root = tk.Tk()
 
-    root.title("PDF 智能裁剪")
+    root.title(f"PDF 智能裁剪 v{__version__}")
     root.geometry("680x640")
     root.minsize(620, 540)
     root.resizable(True, True)
@@ -1070,7 +1072,7 @@ def run_tk_gui(_selftest_dir=None):
     # ---------------- 顶部标题 ----------------
     head = tk.Frame(root, bg=bg)
     head.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 6))
-    tk.Label(head, text="PDF 智能裁剪", bg=bg, fg="#ffffff",
+    tk.Label(head, text=f"PDF 智能裁剪 v{__version__}", bg=bg, fg="#ffffff",
              font=("Microsoft YaHei UI", 15, "bold")).pack(side="left")
     tk.Label(head, text="拖入加入列表 · 每页独立识别边界 · 不重采样",
              bg=bg, fg=dim, font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(10, 0))
